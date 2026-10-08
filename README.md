@@ -54,6 +54,11 @@ async def danger(request: Request):
 - `on_event(kind, data)` 종류: `device_connected`, `public_ip_changed`, `lan_ip_changed`, `server_cert_issued`, `restarted`.
 - 공인 IP 확인을 프로그램의 요청 관리(예: StockWatcher의 길목)로 보내려면 `get_addresses=`에 `{"public": ..., "lan": ...}`를 돌려주는 async 함수를 넘깁니다.
 - 차단은 연결마다 바로 확인하고, 차단 목록·CA·서버 신분증 파일이 바뀌면(다른 프로그램이나 명령줄에서 바꿔도) 15초 안에 외부 문을 다시 엽니다.
+- **접속 기록**: 모든 접속 시도(허용·거부, IP, 이유)를 보관함의 `logs\<프로그램>.log`에 남깁니다.
+  1분 안의 같은 시도는 한 줄로 묶고, 최대 1만 줄입니다. 프로그램에서는 `ext.access.summary()`로 오늘 횟수와 최근 기록을 읽습니다.
+  인터넷에 포트를 열면 스캐너 봇이 수시로 두드리므로 "출입증 없음", "HTTPS 아님" 거부가 꾸준히 보이는 것은 정상입니다.
+- Windows에서 상대가 연결을 갑자기 끊을 때 콘솔에 찍히던 무해한 오류(`WinError 10054`, `_call_connection_lost`)는
+  `quiet_connection_errors()`로 숨깁니다 (외부 문을 열 때 자동 적용, 다른 오류는 그대로 표시).
 
 ## 다른 언어로 만든 프로그램
 

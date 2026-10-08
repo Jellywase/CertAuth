@@ -30,6 +30,7 @@ from typing import Any, Awaitable, Callable
 from cryptography import x509
 
 from . import netinfo, pki
+from .accesslog import AccessLog
 from .store import CertAuthError, Store
 
 log = logging.getLogger("certauth")
@@ -105,28 +106,157 @@ class _PeerRegistry:
             self._d.pop(tuple(client), None)
 
 
-def _protocol_class(store: Store, registry: _PeerRegistry, on_connect: Callable[[dict, Any], None]):
+def _protocol_class(registry: _PeerRegistry):
     from uvicorn.protocols.http.auto import AutoHTTPProtocol
 
     class CertAuthHTTP(AutoHTTPProtocol):  # type: ignore[misc, valid-type]
         def connection_made(self, transport):  # noqa: D401
             super().connection_made(transport)
             info = peer_info(transport)
-            # TLS 단계에서 이미 걸러지지만, 차단 목록은 한 번 더 바로 확인한다 (문을 다시 열기 전 틈 메우기)
-            if info is None or int(info["serial"], 16) in store.revoked_serials():
+            if info is None:
                 transport.close()
                 return
             registry.put(self.client, info)
-            try:
-                on_connect(info, self.client)
-            except Exception:  # noqa: BLE001
-                log.exception("접속 알림 처리 오류")
 
         def connection_lost(self, exc):
             registry.drop(self.client)
             super().connection_lost(exc)
 
     return CertAuthHTTP
+
+
+# ---------- 관문: 연결을 먼저 받고 TLS(출입증 검사)를 직접 진행한다 ----------
+# asyncio에 TLS를 맡기면 실패한 연결은 기록 없이 사라진다. 직접 진행해야 누가 왜 거부됐는지 남길 수 있다.
+HANDSHAKE_TIMEOUT = 10.0
+
+
+def classify_tls_error(e: BaseException) -> str:
+    """TLS 실패 원인을 사람이 읽을 말로."""
+    if isinstance(e, asyncio.TimeoutError | TimeoutError):
+        return "시간 초과 (응답 없음)"
+    if isinstance(e, ssl.SSLCertVerificationError):
+        msg = (e.verify_message or "").lower()
+        if "revoked" in msg:
+            return "차단된 출입증"
+        if "expired" in msg:
+            return "만료된 출입증"
+        if "not yet valid" in msg:
+            return "아직 유효하지 않은 출입증 (기기 시계 확인)"
+        if "issuer" in msg or "self-signed" in msg or "self signed" in msg or "unknown ca" in msg:
+            return "다른 CA의 출입증"
+        return f"출입증 확인 실패 ({e.verify_message})"
+    if isinstance(e, ssl.SSLEOFError):
+        return "중간에 끊음"
+    if isinstance(e, ssl.SSLError):
+        r = (getattr(e, "reason", None) or str(e)).upper()
+        if "PEER_DID_NOT_RETURN_A_CERTIFICATE" in r or "CERTIFICATE_REQUIRED" in r:
+            return "출입증 없음"
+        if "HTTP_REQUEST" in r:
+            return "HTTPS 아님 (평문 HTTP 요청)"
+        if "UNKNOWN_CA" in r or "BAD_CERTIFICATE" in r or "CERTIFICATE_UNKNOWN" in r:
+            return "상대가 서버 신분증을 거부 (CA 미설치 또는 스캐너)"
+        if "WRONG_VERSION" in r or "UNSUPPORTED_PROTOCOL" in r or "VERSION_TOO_LOW" in r or "UNKNOWN_PROTOCOL" in r:
+            return "TLS가 아니거나 오래된 버전"
+        if "NO_SHARED_CIPHER" in r:
+            return "암호 방식 불일치"
+        return f"TLS 오류 ({getattr(e, 'reason', None) or e})"
+    if isinstance(e, ConnectionError | OSError):
+        return "중간에 끊음"
+    return f"오류 ({type(e).__name__})"
+
+
+class _Holding(asyncio.Protocol):
+    """핸드셰이크 직후 ~ 기기 확인이 끝나기 전에 도착한 데이터를 잠시 붙잡아 둔다.
+    (TLS 1.3에서는 클라이언트가 핸드셰이크 끝나자마자 요청을 보내서, 진짜 프로토콜을 붙이기 전에 데이터가 온다)"""
+
+    def __init__(self) -> None:
+        self.buf: list[bytes] = []
+        self.eof = False
+        self.lost: tuple | None = None
+
+    def data_received(self, data: bytes) -> None:
+        self.buf.append(data)
+
+    def eof_received(self):
+        self.eof = True
+        return True
+
+    def connection_lost(self, exc) -> None:
+        self.lost = (exc,)
+
+    def hand_over(self, tls, proto: asyncio.Protocol) -> None:
+        tls.set_protocol(proto)
+        proto.connection_made(tls)
+        for chunk in self.buf:
+            proto.data_received(chunk)
+        self.buf.clear()
+        if self.eof:
+            proto.eof_received()
+        if self.lost is not None:
+            proto.connection_lost(self.lost[0])
+
+
+class _Gate(asyncio.Protocol):
+    """연결 하나를 받아 TLS 핸드셰이크를 진행하고, 통과하면 uvicorn 프로토콜에 넘긴다."""
+
+    def __init__(self, ext: "ExternalServer", ssl_ctx: ssl.SSLContext, make_proto: Callable[[], asyncio.Protocol]):
+        self.ext = ext
+        self.ssl_ctx = ssl_ctx
+        self.make_proto = make_proto
+        self.transport = None
+        self.task: asyncio.Task | None = None
+
+    def connection_made(self, transport) -> None:
+        transport.pause_reading()  # 핸드셰이크 전에 들어온 데이터를 놓치지 않도록 TLS 계층이 읽게 한다
+        self.transport = transport
+        self.ext._gates.add(self)
+        self.task = asyncio.get_running_loop().create_task(self._handshake())
+
+    def connection_lost(self, exc) -> None:
+        if self.task and not self.task.done():
+            self.task.cancel()
+        self.ext._gates.discard(self)
+
+    def data_received(self, data) -> None:  # pause_reading 중이라 오지 않는다
+        pass
+
+    def abort(self) -> None:
+        if self.task and not self.task.done():
+            self.task.cancel()
+        if self.transport:
+            self.transport.abort()
+
+    async def _handshake(self) -> None:
+        ext = self.ext
+        peer = self.transport.get_extra_info("peername")
+        ip = peer[0] if isinstance(peer, tuple) and peer else "?"
+        holding = _Holding()
+        loop = asyncio.get_running_loop()
+        try:
+            tls = await loop.start_tls(self.transport, holding, self.ssl_ctx, server_side=True,
+                                       ssl_handshake_timeout=HANDSHAKE_TIMEOUT)
+        except asyncio.CancelledError:
+            self.transport.abort()
+            raise
+        except BaseException as e:  # noqa: BLE001  — 실패는 모두 기록하고 연결을 닫는다
+            ext.access.record(ip, False, classify_tls_error(e))
+            self.transport.abort()
+            ext._gates.discard(self)
+            return
+        ext._gates.discard(self)
+        info = peer_info(tls)
+        if info is None:
+            ext.access.record(ip, False, "출입증 없음")
+            tls.abort()
+            return
+        # TLS의 차단 목록에 더해 보관함 목록으로 한 번 더 (다른 프로그램이 방금 차단한 경우까지)
+        if int(info["serial"], 16) in ext.store.revoked_serials():
+            ext.access.record(ip, False, f"차단된 출입증: {info['name']}")
+            tls.abort()
+            return
+        ext.access.record(ip, True, info["name"])
+        holding.hand_over(tls, self.make_proto())
+        ext._on_connect(info, peer)
 
 
 def _mark_external(app, registry: _PeerRegistry):
@@ -146,13 +276,13 @@ def _mark_external(app, registry: _PeerRegistry):
     return wrapped
 
 
-def _make_server(app, ssl_ctx: ssl.SSLContext, protocol_cls, log_level: str):
+def _make_server(app, protocol_factory, log_level: str):
     import uvicorn
 
     class _Config(uvicorn.Config):
         def load(self) -> None:
             super().load()
-            self.ssl = ssl_ctx  # uvicorn 버전과 상관없이 직접 만든 TLS 설정을 쓴다
+            self.ssl = None  # TLS는 관문(_Gate)이 직접 진행한다
 
     class _Server(uvicorn.Server):
         # 신호(Ctrl+C)는 내부 문(주 서버)이 처리한다. 외부 문은 가로채지 않는다.
@@ -163,7 +293,7 @@ def _make_server(app, ssl_ctx: ssl.SSLContext, protocol_cls, log_level: str):
         def capture_signals(self):  # uvicorn 신버전
             yield
 
-    config = _Config(app, lifespan="off", http=protocol_cls, log_level=log_level, access_log=False,
+    config = _Config(app, lifespan="off", http=protocol_factory, log_level=log_level, access_log=False,
                      timeout_graceful_shutdown=5, server_header=False)
     return _Server(config)
 
@@ -184,6 +314,29 @@ def _bind(host: str, port: int) -> socket.socket:
     return sock
 
 
+_QUIET = (ConnectionResetError, ConnectionAbortedError, BrokenPipeError)
+
+
+def quiet_connection_errors(loop: asyncio.AbstractEventLoop | None = None) -> None:
+    """상대가 연결을 갑자기 끊었을 때 Windows asyncio가 찍는 무해한 오류
+    ('Exception in callback _ProactorBasePipeTransport._call_connection_lost', WinError 10054)를 숨긴다.
+    다른 오류는 원래대로 보여준다. 여러 번 불러도 한 번만 설치된다."""
+    loop = loop or asyncio.get_running_loop()
+    prev = loop.get_exception_handler()
+    if getattr(prev, "_certauth_quiet", False):
+        return
+
+    def handler(lp, context):
+        if isinstance(context.get("exception"), _QUIET):
+            return
+        if prev:
+            prev(lp, context)
+        else:
+            lp.default_exception_handler(context)
+    handler._certauth_quiet = True  # type: ignore[attr-defined]
+    loop.set_exception_handler(handler)
+
+
 async def default_addresses() -> dict:
     pub, lan = await asyncio.gather(asyncio.to_thread(netinfo.public_ip), asyncio.to_thread(netinfo.lan_ip))
     return {"public": pub, "lan": lan}
@@ -193,7 +346,7 @@ class ExternalServer:
     def __init__(self, app, *, program: str, port: int, host: str = "0.0.0.0", store: Store | None = None,
                  get_addresses: AddressGetter | None = None, on_event: EventHandler | None = None,
                  extra_ips: list[str] | None = None, check_interval: float = 15.0,
-                 address_interval: float = 600.0, log_level: str = "warning"):
+                 address_interval: float = 600.0, log_level: str = "warning", log_max_lines: int = 10_000):
         self.app = app
         self.program = program
         self.port = int(port)
@@ -206,6 +359,9 @@ class ExternalServer:
         self.address_interval = address_interval
         self.log_level = log_level
         self.registry = _PeerRegistry()
+        # 접속 기록: 보관함/logs/<프로그램>.log (허용·거부 모두, 1분 안 반복은 묶음, 최대 줄 수 제한)
+        self.access = AccessLog(self.store.root / "logs" / f"{program}.log", max_lines=log_max_lines)
+        self._gates: set[_Gate] = set()
         self.addresses: dict = {"public": None, "lan": None}
         self.started_at: float | None = None
         self.last_error: str | None = None
@@ -225,6 +381,7 @@ class ExternalServer:
         async with self._lock:
             if self._serve_task and not self._serve_task.done():
                 return
+            quiet_connection_errors()
             await asyncio.to_thread(self.store.init_ca)
             await self._refresh_addresses()
             await self._launch()
@@ -239,6 +396,7 @@ class ExternalServer:
                     await self._watch_task
                 self._watch_task = None
             await self._shutdown()
+            self.access.flush(force=True)
 
     async def restart(self, reason: str = "") -> None:
         async with self._lock:
@@ -262,6 +420,7 @@ class ExternalServer:
             "addresses": dict(self.addresses), "server_cert": info, "started_at": self.started_at,
             "last_error": self.last_error, "last_address_check": self.last_address_check or None,
             "connections": len(self._server.server_state.connections) if self._server else 0,
+            "access_log": str(self.access.path),
         }
 
     # ---------- 내부 ----------
@@ -309,8 +468,12 @@ class ExternalServer:
         self.last_error = None
         ssl_ctx = await asyncio.to_thread(server_ssl_context, self.store, self.program)
         self._gen = self.store.generation(self.program)
-        proto = _protocol_class(self.store, self.registry, self._on_connect)
-        server = _make_server(_mark_external(self.app, self.registry), ssl_ctx, proto, self.log_level)
+        proto_cls = _protocol_class(self.registry)
+
+        def factory(**kw):  # uvicorn이 연결마다 부른다 → 관문이 TLS를 마친 뒤 uvicorn 프로토콜에 넘긴다
+            return _Gate(self, ssl_ctx, lambda: proto_cls(**kw))
+
+        server = _make_server(_mark_external(self.app, self.registry), factory, self.log_level)
         sock = _bind(self.host, self.port)
         self._server = server
 
@@ -338,6 +501,9 @@ class ExternalServer:
         server, task = self._server, self._serve_task
         self._server, self._serve_task = None, None
         self.started_at = None
+        for g in list(self._gates):  # 핸드셰이크 중이던 연결
+            g.abort()
+        self._gates.clear()
         if not server or not task:
             return
         server.should_exit = True
@@ -352,6 +518,7 @@ class ExternalServer:
         while True:
             await asyncio.sleep(self.check_interval)
             try:
+                self.access.flush()
                 if self._serve_task and self._serve_task.done():
                     # 예상치 못하게 멈췄으면 다시 연다
                     await self.restart("외부 문이 멈춰서 다시 열기")

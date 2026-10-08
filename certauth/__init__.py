@@ -4,22 +4,23 @@
 
 자세한 사용법은 README.md, 보관함 형식은 docs/FORMAT.md.
 """
+from .accesslog import AccessLog
 from .bundles import delete_exports, export_device, list_exports
 from .store import PLATFORMS, CertAuthError, Store, default_root
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "PLATFORMS", "CertAuthError", "Store", "default_root",
     "export_device", "list_exports", "delete_exports",
-    "ExternalServer", "is_external", "request_device", "server_ssl_context",
-    "__version__",
+    "ExternalServer", "is_external", "request_device", "server_ssl_context", "quiet_connection_errors",
+    "AccessLog", "__version__",
 ]
 
 
 def __getattr__(name):
     # uvicorn이 필요한 부분은 쓸 때만 불러온다 (명령줄 도구는 uvicorn 없이도 동작)
-    if name in ("ExternalServer", "is_external", "request_device", "server_ssl_context"):
+    if name in ("ExternalServer", "is_external", "request_device", "server_ssl_context", "quiet_connection_errors"):
         from . import server
         return getattr(server, name)
     raise AttributeError(name)
