@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "certauth"
+version = "0.1.0"
+description = "여러 개인 프로그램이 함께 쓰는 기기 출입증(클라이언트 인증서, mTLS) 원격 접속 모듈"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["cryptography>=42"]
+
+[project.optional-dependencies]
+server = ["uvicorn>=0.30"]
+test = ["pytest", "httpx", "uvicorn>=0.30", "starlette"]
+
+[tool.setuptools]
+packages = ["certauth"]

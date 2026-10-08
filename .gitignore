@@ -1,0 +1,12 @@
+__pycache__/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+# 인증서·키는 절대 저장소에 넣지 않는다
+*.p12
+*.pfx
+*.key
+*.pem
+*.crt
+*.mobileconfig
