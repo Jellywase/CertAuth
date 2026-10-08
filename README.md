@@ -20,13 +20,14 @@ PC 브라우저 ─────────────────▶ 프로그
 
 ## 설치
 
-프로그램의 `requirements.txt`에 버전 태그를 고정해 넣습니다 (git 없이 설치됨).
+프로그램의 `requirements.txt`에 커밋(또는 태그)을 고정해 넣습니다. git이 없어도 설치됩니다.
 
 ```
-certauth @ https://github.com/Jellywase/CertAuth/archive/refs/tags/v0.1.0.zip
+certauth @ https://github.com/Jellywase/CertAuth/archive/<커밋 해시>.zip
+certauth @ https://github.com/Jellywase/CertAuth/archive/refs/tags/v0.1.0.zip   (태그를 만들었다면)
 ```
 
-CertAuth를 고치면 새 태그를 만들고 각 프로그램의 주소를 그 태그로 바꿉니다.
+CertAuth를 고치면 각 프로그램의 주소를 새 커밋(태그)으로 바꿉니다. 주소가 바뀌어야 다시 설치됩니다.
 
 ## 파이썬 웹 프로그램에 붙이기 (FastAPI·Starlette 등 ASGI)
 
