@@ -191,3 +191,45 @@ def test_internal_request_not_external():
             r = await c.get("/who")
         assert r.json() == {"external": False, "device": None}
     run(main())
+
+
+def test_closed_listening_socket_counts_as_stopped_and_watcher_reopens(store):
+    """asyncio가 듣는 소켓만 닫고 작업은 살아 있는 경우(예전 Windows Proactor의 WinError 64): running은 False이고
+    감시가 다시 연다."""
+    async def main():
+        port = free_port()
+        events = []
+        ext = ExternalServer(make_app(), program="test", port=port, host="127.0.0.1", store=store,
+                             get_addresses=Addr(), on_event=lambda k, d: events.append((k, d)), check_interval=0.2)
+        await ext.start()
+        try:
+            assert ext.running
+            ext._sock.close()
+            assert not ext.running
+            for _ in range(40):
+                await asyncio.sleep(0.1)
+                if any(k == "restarted" for k, _ in events) and ext.running:
+                    break
+            assert any(k == "restarted" and "멈춰서" in d["reason"] for k, d in events)
+            assert ext.running
+        finally:
+            await ext.stop()
+    run(main())
+
+
+def test_proactor_loop_is_refused_on_windows(monkeypatch):
+    import certauth.server as srv
+    from certauth import UnsupportedLoopError
+
+    class FakeProactor(asyncio.SelectorEventLoop):
+        pass
+
+    monkeypatch.setattr(srv.sys, "platform", "win32")
+    monkeypatch.setattr(asyncio, "ProactorEventLoop", FakeProactor, raising=False)
+    loop = FakeProactor()
+    try:
+        with pytest.raises(UnsupportedLoopError):
+            srv.check_event_loop(loop)
+        srv.check_event_loop(asyncio.SelectorEventLoop())   # Selector는 통과
+    finally:
+        loop.close()

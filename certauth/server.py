@@ -314,6 +314,24 @@ def _bind(host: str, port: int) -> socket.socket:
     return sock
 
 
+class UnsupportedLoopError(CertAuthError):
+    pass
+
+
+def check_event_loop(loop: asyncio.AbstractEventLoop | None = None) -> None:
+    """Windows의 Proactor 이벤트 루프에서는 외부 문을 열지 않는다 (오류).
+    Proactor는 연결 하나가 받는 도중에 끊기면(WinError 64) 그 연결이 아니라 듣는 소켓 자체를 닫아 버린다.
+    인터넷에 연 포트는 스캐너가 수시로 두드리므로 문이 조용히 죽는다. Selector 루프는 그 연결만 버리고 계속 받는다.
+    프로그램이 루프를 Selector로 골라 실행해야 한다 (예: asyncio.Runner(loop_factory=asyncio.SelectorEventLoop))."""
+    loop = loop or asyncio.get_running_loop()
+    proactor = getattr(asyncio, "ProactorEventLoop", None)
+    if sys.platform == "win32" and proactor is not None and isinstance(loop, proactor):
+        raise UnsupportedLoopError(
+            "Windows Proactor 이벤트 루프에서는 외부 문을 열 수 없습니다: 연결 하나가 받는 도중 끊기면(WinError 64) "
+            "asyncio가 듣는 소켓을 닫아 문이 멈춥니다. 프로그램을 Selector 이벤트 루프로 실행하세요 "
+            "(asyncio.Runner(loop_factory=asyncio.SelectorEventLoop)).")
+
+
 _QUIET = (ConnectionResetError, ConnectionAbortedError, BrokenPipeError)
 
 
@@ -367,6 +385,7 @@ class ExternalServer:
         self.last_error: str | None = None
         self.last_address_check = 0.0
         self._server = None
+        self._sock: socket.socket | None = None
         self._serve_task: asyncio.Task | None = None
         self._watch_task: asyncio.Task | None = None
         self._gen: tuple | None = None
@@ -375,12 +394,16 @@ class ExternalServer:
     # ---------- 공개 메서드 ----------
     @property
     def running(self) -> bool:
-        return bool(self._serve_task and not self._serve_task.done() and self._server and self._server.started)
+        """실제로 연결을 받고 있는가: 작업이 살아 있고, 시작했고, 듣는 소켓이 열려 있다
+        (asyncio가 소켓만 닫고 작업은 살아 있는 경우도 '멈춤'으로 본다)."""
+        return bool(self._serve_task and not self._serve_task.done() and self._server and self._server.started
+                    and self._sock is not None and self._sock.fileno() != -1)
 
     async def start(self) -> None:
         async with self._lock:
             if self._serve_task and not self._serve_task.done():
                 return
+            check_event_loop()
             quiet_connection_errors()
             await asyncio.to_thread(self.store.init_ca)
             await self._refresh_addresses()
@@ -476,6 +499,7 @@ class ExternalServer:
         server = _make_server(_mark_external(self.app, self.registry), factory, self.log_level)
         sock = _bind(self.host, self.port)
         self._server = server
+        self._sock = sock
 
         async def _run():
             try:
@@ -499,7 +523,7 @@ class ExternalServer:
 
     async def _shutdown(self) -> None:
         server, task = self._server, self._serve_task
-        self._server, self._serve_task = None, None
+        self._server, self._serve_task, self._sock = None, None, None
         self.started_at = None
         for g in list(self._gates):  # 핸드셰이크 중이던 연결
             g.abort()
@@ -513,14 +537,17 @@ class ExternalServer:
             server.force_exit = True
             with contextlib.suppress(asyncio.TimeoutError, Exception):
                 await asyncio.wait_for(task, timeout=3)
+        except Exception as e:  # noqa: BLE001
+            # 이미 망가진 문(듣는 소켓이 닫힘 등)을 닫다 난 오류: 닫기는 끝난 것이므로 기록하고 다시 열기로 넘어간다
+            log.warning("외부 문을 닫는 중 오류 (기록하고 계속): %s: %s", type(e).__name__, e)
 
     async def _watch(self) -> None:
         while True:
             await asyncio.sleep(self.check_interval)
             try:
                 self.access.flush()
-                if self._serve_task and self._serve_task.done():
-                    # 예상치 못하게 멈췄으면 다시 연다
+                if self._serve_task and (self._serve_task.done() or self._sock is None or self._sock.fileno() == -1):
+                    # 예상치 못하게 멈췄으면(작업이 끝났거나 듣는 소켓이 닫힘) 다시 연다
                     await self.restart("외부 문이 멈춰서 다시 열기")
                     continue
                 if time.time() - self.last_address_check >= self.address_interval:

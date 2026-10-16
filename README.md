@@ -49,6 +49,12 @@ async def danger(request: Request):
         ...
 ```
 
+- **Windows에서는 Selector 이벤트 루프로 실행해야 합니다.** 기본값인 Proactor 루프는 연결 하나가 받는 도중 끊기면
+  (`WinError 64`, 인터넷에 연 포트를 스캐너가 두드릴 때 흔함) 그 연결이 아니라 듣는 소켓을 닫아 버려서, 문이 조용히 멈춥니다.
+  Proactor 루프에서 `start()`를 부르면 `UnsupportedLoopError`로 거절합니다. 예:
+  `with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as r: r.run(server.serve())`
+  (Selector 루프에서는 asyncio 하위 프로세스를 쓸 수 없습니다. `subprocess.Popen`은 그대로 됩니다.)
+- `running`은 듣는 소켓이 실제로 열려 있는지까지 봅니다. 감시가 멈춘 문(작업이 끝났거나 소켓이 닫힘)을 15초 안에 다시 엽니다.
 - 외부 문은 앱의 lifespan을 다시 실행하지 않습니다 (내부 문에서 이미 실행 중이므로).
 - `is_external()`은 헤더가 아니라 서버가 직접 붙이는 값이라 흉내 낼 수 없습니다. 웹소켓에도 똑같이 붙습니다.
 - `on_event(kind, data)` 종류: `device_connected`, `public_ip_changed`, `lan_ip_changed`, `server_cert_issued`, `restarted`.
